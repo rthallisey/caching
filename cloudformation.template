@@ -1,0 +1,284 @@
+{
+  "AWSTemplateFormatVersion" : "2010-09-09",
+
+  "Description" : "AWS CloudFormation AutoScaling Template.",
+  "Parameters" : {
+    "InstanceType" : {
+      "Description" : "WebServer EC2 instance type",
+      "Type" : "String",
+      "Default" : "t1.micro",
+      "AllowedValues" : [ "t1.micro", "t2.nano" ],
+      "ConstraintDescription" : "must be a valid EC2 instance type."
+    },
+
+    "AccessKey" : {
+      "Description" : "AWS access Key"
+      "Type" : "String"    # There's probably a type for this..
+      "ConstraintDescription" : "must be your AWS account key."
+    },
+    "SecretAccessKey" : {
+      "Description" : "AWS secret access key"
+      "Type" : "String"    # There's probably a type for this..
+      "ConstraintDescription" : "must be you AWS secret access key."
+    },
+
+    "KeyName" : {
+      "Description" : "The EC2 Key Pair to allow SSH access to the instances",
+      "Type" : "AWS::EC2::KeyPair::KeyName",
+      "ConstraintDescription" : "must be the name of an existing EC2 KeyPair."
+    },
+
+    "SSHLocation" : {
+      "Description" : "The IP address range that can be used to SSH to the EC2 instances",
+      "Type": "String",
+      "MinLength": "9",
+      "MaxLength": "18",
+      "Default": "0.0.0.0/0",
+      "AllowedPattern": "(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})",
+      "ConstraintDescription": "must be a valid IP CIDR range of the form x.x.x.x/x."
+   }
+
+  },
+
+  "Mappings" : {
+    "AWSInstanceType2Arch" : {
+      "t1.micro"    : { "Arch" : "HVM64"  },
+      "t2.nano"     : { "Arch" : "HVM64"  }
+    },
+
+    "AWSInstanceType2NATArch" : {
+      "t1.micro"    : { "Arch" : "NATHVM64"  },
+      "t2.nano"     : { "Arch" : "NATHVM64"  },
+    },
+    "AWSRegionArch2AMI" : {
+      "us-east-1"        : {"HVM64" : "ami-04a3d424ed14a1996"}
+    }
+
+  },
+
+  "Resources" : {
+    "CacheScaling" : {
+      "Type" : "AWS::AutoScaling::AutoScalingGroup",
+      "Properties" : {
+        "AvailabilityZones": ["us-east-1a"],
+        "LaunchConfigurationName" : { "Ref" : "LaunchConfig" },
+        "MinSize" : "1",
+        "MaxSize" : "2",
+      },
+      "CreationPolicy" : {
+        "ResourceSignal" : {
+          "Timeout" : "PT15M",
+          "Count"   : "0"
+        }
+      },
+      "UpdatePolicy": {
+        "AutoScalingRollingUpdate": {
+          "MinInstancesInService": "1",
+          "MaxBatchSize": "1",
+          "PauseTime" : "PT15M",
+          "WaitOnResourceSignals": "true"
+        }
+      }
+    },
+
+    "LaunchConfig" : {
+      "Type" : "AWS::AutoScaling::LaunchConfiguration",
+      "Metadata" : {
+        "Comment" : "Ensure the cache is hot",
+        "AWS::CloudFormation::Init" : {
+          "config" : {
+            "packages" : {
+              "yum" : {
+                "httpd" : [],
+                "python-pip" : []
+              }
+            },
+
+            "files" : {
+              "/home/ec2-user/db-backup.sh" : {
+                "content" : { "Fn::Join" : ["", [
+                  "#!/bin/bash\n",
+
+                  "BACKUP=\"/tmp/db_backup.db\"\n",
+
+                  "sqlite3 /home/ec2-user/cache.db \".dump\" > \"${BACKUP}\"\n",
+
+                  "# TODO: Use some filtering of the event_count value to find the most commonly used values.\n",
+                  "#       We could make some "educated guesses" that the higher the event_count the more likely\n",
+                  "#       a value will be used in the future.  Could filter for the top 10,000 events and store\n",
+                  "#       them to the s3 backup as "priority-backup" in order to load them first to warm the cache.\n",
+                  "#\n",
+                  "#       Look at Linux kernel in memory caching techniques/algorithms in order to optimize.\n",
+
+                  "aws s3 cp \"${BACKUP}\" s3://cache-sqlite\n",
+                ]]},
+                "mode"    : "000777",
+                "owner"   : "root",
+                "group"   : "root"
+              },
+
+              "/home/ec2-user/db-restore.sh" : {
+                "content" : { "Fn::Join" : ["", [
+                  "#!/bin/bash\n",
+
+                  "DATABASE=\"/home/ec2-user/cache.db\"\n",
+                  "RESTORE=\"/home/ec2-user/restore.db\"\n",
+
+                  "# Expecting this file to always be there.  At least on the AMI\n",
+                  "rm \"${DATABASE}\"\n",
+
+                  "aws s3 cp s3://cache-sqlite/db_backup.db \"${RESTORE}\"\n",
+
+                  "# TODO:  Need some retry logic here.  We want to do the best we can to guartunee the cache is warm.\n",
+
+                  "sqlite3 \"${DATABASE}\" \".read ${RESTORE}\n\"",
+
+                  "# TODO:  Validation for new data loaded.\n",
+
+                ]]},
+                "mode"    : "000777",
+                "owner"   : "root",
+                "group"   : "root"
+              },
+
+              "/etc/cfn/cfn-hup.conf" : {
+                "content" : { "Fn::Join" : ["", [
+                  "[main]\n",
+                  "stack=", { "Ref" : "AWS::StackId" }, "\n",
+                  "region=", { "Ref" : "AWS::Region" }, "\n"
+                ]]},
+                "mode"    : "000400",
+                "owner"   : "root",
+                "group"   : "root"
+              },
+
+              "/etc/cfn/hooks.d/cfn-auto-reloader.conf" : {
+                "content": { "Fn::Join" : ["", [
+                  "[cfn-auto-reloader-hook]\n",
+                  "triggers=post.update\n",
+                  "path=Resources.LaunchConfig.Metadata.AWS::CloudFormation::Init\n",
+                  "action=/opt/aws/bin/cfn-init -v ",
+                  "         --stack ", { "Ref" : "AWS::StackName" },
+                  "         --resource LaunchConfig ",
+                  "         --region ", { "Ref" : "AWS::Region" }, "\n",
+                  "runas=root\n"
+                ]]},
+                "mode"    : "000400",
+                "owner"   : "root",
+                "group"   : "root"
+              }
+            },
+
+            "services" : {
+              "sysvinit" : {
+                "httpd"    : { "enabled" : "true", "ensureRunning" : "true" },
+                "cfn-hup" : { "enabled" : "true", "ensureRunning" : "true",
+                              "files" : ["/etc/cfn/cfn-hup.conf", "/etc/cfn/hooks.d/cfn-auto-reloader.conf"]}
+              }
+            }
+          }
+        }
+      },
+      "Properties" : {
+        "KeyName" : { "Ref" : "KeyName" },
+        "ImageId" : { "Fn::FindInMap" : [ "AWSRegionArch2AMI", { "Ref" : "AWS::Region" },
+                                          { "Fn::FindInMap" : [ "AWSInstanceType2Arch", { "Ref" : "InstanceType" }, "Arch" ] } ] },
+        "SecurityGroups" : [ { "Ref" : "InstanceSecurityGroup" } ],
+        "InstanceType" : { "Ref" : "InstanceType" },
+        "UserData"       : { "Fn::Base64" : { "Fn::Join" : ["", [
+             "#!/bin/bash -xe\n",
+             "yum update -y aws-cfn-bootstrap\n",
+
+             "yum update -y aws-cli\n",
+
+	     "/home/ec2-user/db-restore.sh"
+
+             "echo [default] | tee - /home/ec3-user/.aws/credentials\n",
+             "echo ", {"Ref" : "AccessKey" }, "| tee -a /home/ec3-user/.aws/credentials\n",
+             "echo ", {"Ref" : "SecretAccessKey" }, "| tee -a /home/ec3-user/.aws/credentials\n",
+
+             "echo \"*/5 * * * * bash /home/ec2-user/db-backup.sh\" | tee - cronjob\n",
+
+             "/opt/aws/bin/cfn-init -v ",
+             "         --stack ", { "Ref" : "AWS::StackName" },
+             "         --resource LaunchConfig ",
+             "         --region ", { "Ref" : "AWS::Region" }, "\n",
+
+             "/opt/aws/bin/cfn-signal -e $? ",
+             "         --success",
+             "         --stack ", { "Ref" : "AWS::StackName" },
+             "         --resource WebServerGroup ",
+             "         --region ", { "Ref" : "AWS::Region" }, "\n"
+        ]]}}
+      }
+    },
+
+    "CacheScaleUpPolicy" : {
+      "Type" : "AWS::AutoScaling::ScalingPolicy",
+      "Properties" : {
+        "AdjustmentType" : "ChangeInCapacity",
+        "AutoScalingGroupName" : { "Ref" : "CacheScaling" },
+        "Cooldown" : "60",
+        "ScalingAdjustment" : "1"
+      }
+    },
+    "CacheScaleDownPolicy" : {
+      "Type" : "AWS::AutoScaling::ScalingPolicy",
+      "Properties" : {
+        "AdjustmentType" : "ChangeInCapacity",
+        "AutoScalingGroupName" : { "Ref" : "CacheScaling" },
+        "Cooldown" : "60",
+        "ScalingAdjustment" : "-1"
+      }
+    },
+
+    "CPUAlarmHigh": {
+     "Type": "AWS::CloudWatch::Alarm",
+     "Properties": {
+        "AlarmDescription": "Scale-up if CPU > 90% for 10 minutes",
+        "MetricName": "CPUUtilization",
+        "Namespace": "AWS/EC2",
+        "Statistic": "Average",
+        "Period": "300",
+        "EvaluationPeriods": "2",
+        "Threshold": "90",
+        "AlarmActions": [ { "Ref": "CacheScaleUpPolicy" } ],
+        "Dimensions": [
+          {
+            "Name": "AutoScalingGroupName",
+            "Value": { "Ref": "CacheScaling" }
+          }
+        ],
+        "ComparisonOperator": "GreaterThanThreshold"
+      }
+    },
+    "CPUAlarmLow": {
+     "Type": "AWS::CloudWatch::Alarm",
+     "Properties": {
+        "AlarmDescription": "Scale-down if CPU < 70% for 10 minutes",
+        "MetricName": "CPUUtilization",
+        "Namespace": "AWS/EC2",
+        "Statistic": "Average",
+        "Period": "300",
+        "EvaluationPeriods": "2",
+        "Threshold": "70",
+        "AlarmActions": [ { "Ref": "CacheScaleDownPolicy" } ],
+        "Dimensions": [
+          {
+            "Name": "AutoScalingGroupName",
+            "Value": { "Ref": "CacheScaling" }
+          }
+        ],
+        "ComparisonOperator": "LessThanThreshold"
+      }
+    },
+    "InstanceSecurityGroup" : {
+      "Type" : "AWS::EC2::SecurityGroup",
+      "Properties" : {
+        "GroupDescription" : "Enable SSH access",
+        "SecurityGroupIngress" : { "IpProtocol" : "tcp", "FromPort" : "22", "ToPort" : "22", "CidrIp" : { "Ref" : "SSHLocation"} }
+      }
+    }
+
+  }
+}
